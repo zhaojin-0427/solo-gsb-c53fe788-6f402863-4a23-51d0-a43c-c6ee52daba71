@@ -103,15 +103,59 @@ def test_search_budget_recompute_calls():
     assert exc.value.details["recompute_calls"] == 6
 
 
+def make_pool(active_rows, inert_rows):
+    """RecomputePool for a plain sum over the labeled members.
+
+    Each row spec is ``(id, value)``: member (id,) with a singleton witness
+    L("t", id). Active rows carry a non-zero value, inert rows a zero value.
+    The target total is the sum of every value.
+    """
+    from app.evaluator import RecomputePool
+
+    rows = [
+        {"data": (v,), "witnesses": {frozenset([L("t", i)])}}
+        for i, v in active_rows + inert_rows
+    ]
+    flags = [True] * len(active_rows) + [False] * len(inert_rows)
+    active_labels = {L("t", i) for i, _ in active_rows}
+    full = active_labels | {L("t", i) for i, _ in inert_rows}
+    target = sum(v for _, v in active_rows + inert_rows)
+    return RecomputePool(
+        full=full,
+        reduced=set(active_labels),
+        group_member_count=len(rows),
+        active_member_count=len(active_rows),
+        active_labels=active_labels,
+        member_rows=rows,
+        member_active=flags,
+        agg_spec=[("sum", "v", "total")],
+        input_names=["v"],
+        target_values={"total": target},
+        group_by=[],
+    )
+
+
+def sustains_of(pool):
+    """Structural replay matching the evaluator's target_group_sustains."""
+    def sustains(removed):
+        surviving = [
+            m for m in pool.member_rows
+            if any(w.isdisjoint(removed) for w in m["witnesses"])
+        ]
+        if not surviving:
+            return False
+        total = sum(m["data"][0] for m in surviving)
+        return total == pool.target_values["total"]
+
+    return sustains
+
+
 def test_refine_pool_gate_passes_when_every_active_singleton_kills():
     # One-to-one join style: each active label kills on its own, so the
     # inert-only labels (the zero pairs) stay reduced out.
-    active = {L("t", 1), L("t", 2)}
-    full = active | {L("z", i) for i in range(9)}
-    pool, outcomes, calls = refine_reduced_pool(
-        active, active, full, lambda d: True
-    )
-    assert pool == active
+    pool = make_pool([(1, 5), (2, -5)], [(i, 0) for i in range(3, 12)])
+    refined, outcomes, calls = refine_reduced_pool(pool, sustains_of(pool))
+    assert refined == {L("t", 1), L("t", 2)}
     assert calls == 2
     assert outcomes == {
         frozenset([L("t", 1)]): True,
@@ -119,30 +163,101 @@ def test_refine_pool_gate_passes_when_every_active_singleton_kills():
     }
 
 
-def test_refine_pool_gate_widens_on_nonsingleton_label():
-    # Self-join style: label t1 alone does not kill (its +5/-5 members
-    # cancel); the gate must stop immediately and widen back to the full
-    # pool, preserving the inert zero-pair labels.
+def test_refine_pool_gate_admits_sustaining_zero_label_only():
+    # total=0 self-join style: members +5 (labels {1,2}), -5 ({1,3}) and a
+    # zero self-pair ({4}). Deleting label 1 removes both signed members
+    # (net zero) while the zero self-pair sustains total=0, so label 4 is
+    # admitted; an independent padding zero label is not.
+    from app.evaluator import RecomputePool
+
+    rows = [
+        {"data": (5,), "witnesses": {frozenset([L("t", 1), L("t", 2)])}},
+        {"data": (-5,), "witnesses": {frozenset([L("t", 1), L("t", 3)])}},
+        {"data": (0,), "witnesses": {frozenset([L("t", 4)])}},
+        {"data": (0,), "witnesses": {frozenset([L("t", 9)])}},
+    ]
     active = {L("t", 1), L("t", 2), L("t", 3)}
-    inert = {L("t", 4)}
-    full = active | inert
+    pool = RecomputePool(
+        full=active | {L("t", 4), L("t", 9)},
+        reduced=set(active),
+        group_member_count=4,
+        active_member_count=2,
+        active_labels=active,
+        member_rows=rows,
+        member_active=[True, True, False, False],
+        agg_spec=[("sum", "v", "total")],
+        input_names=["v"],
+        target_values={"total": 0},
+        group_by=[],
+    )
 
-    def kills(d):
-        # t1 removes both cancelling members -> not killing; t2/t3 do.
-        if d == frozenset([L("t", 1)]):
+    def sustains(removed):
+        surviving = [
+            m for m in rows if any(w.isdisjoint(removed) for w in m["witnesses"])
+        ]
+        if not surviving:
             return False
-        return True
+        return sum(m["data"][0] for m in surviving) == 0
 
-    pool, outcomes, calls = refine_reduced_pool(active, active, full, kills)
-    assert pool == full
-    assert calls == 1
-    assert outcomes == {frozenset([L("t", 1)]): False}
+    refined, outcomes, _ = refine_reduced_pool(pool, sustains)
+    # Label 1 alone does not kill; label 4 keeps the zero target alive and is
+    # admitted. The independent zero label 9 is admitted too: with a zero
+    # target, {1,4,9} is itself an inclusion-minimal killing set (removing
+    # any one of them leaves a zero-valued survivor and total=0 in place).
+    assert outcomes[frozenset([L("t", 1)])] is False
+    assert L("t", 4) in refined
+    assert L("t", 9) in refined
+    assert {L("t", 1), L("t", 2), L("t", 3)} <= refined
+
+
+def test_refine_pool_nonzero_target_rejects_all_zero_labels():
+    # total=7: members +5 (labels {1,2}), -5 ({1,3}), a +7 self-pair
+    # ({4}, active) and 18 independent zero self-pairs. Zero survivors cannot
+    # sustain total=7, so no inert label is admitted even though the label-1
+    # singleton fails to kill (it removes the +5 and -5 members together).
+    from app.evaluator import RecomputePool
+
+    rows = [
+        {"data": (5,), "witnesses": {frozenset([L("t", 1), L("t", 2)])}},
+        {"data": (-5,), "witnesses": {frozenset([L("t", 1), L("t", 3)])}},
+        {"data": (7,), "witnesses": {frozenset([L("t", 4)])}},
+    ] + [
+        {"data": (0,), "witnesses": {frozenset([L("t", i)])}}
+        for i in range(5, 23)
+    ]
+    active = {L("t", 1), L("t", 2), L("t", 3), L("t", 4)}
+    pool = RecomputePool(
+        full=active | {L("t", i) for i in range(5, 23)},
+        reduced=set(active),
+        group_member_count=21,
+        active_member_count=3,
+        active_labels=active,
+        member_rows=rows,
+        member_active=[True, True, True] + [False] * 18,
+        agg_spec=[("sum", "v", "total")],
+        input_names=["v"],
+        target_values={"total": 7},
+        group_by=[],
+    )
+
+    def sustains(removed):
+        surviving = [
+            m for m in rows if any(w.isdisjoint(removed) for w in m["witnesses"])
+        ]
+        if not surviving:
+            return False
+        return sum(m["data"][0] for m in surviving) == 7
+
+    refined, outcomes, _ = refine_reduced_pool(pool, sustains)
+    assert outcomes[frozenset([L("t", 1)])] is False
+    assert refined == active
+    assert all(L("t", i) not in refined for i in range(5, 23))
 
 
 def test_refine_pool_recomputes_count_toward_budget():
-    active = {L("t", 1), L("t", 2)}
+    pool = make_pool([(1, 5), (2, -5)], [])
     with pytest.raises(SearchBudgetExceeded) as exc:
-        refine_reduced_pool(active, active, active, lambda d: True, max_calls=1)
+        refine_reduced_pool(pool, sustains_of(pool), max_calls=1)
     assert exc.value.reason == "recompute_budget"
     # The first call fits the budget; the second (which would exceed it)
     # raises — the same convention as minimal_deletion_sets_by_recompute.

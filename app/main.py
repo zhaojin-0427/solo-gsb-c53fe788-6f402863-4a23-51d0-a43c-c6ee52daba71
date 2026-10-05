@@ -210,13 +210,14 @@ def deletion_sets_for_target(
     """
     pool = ev.mixed_sign_sum_pool(payload.plan, target_raw["data"])
     if pool is not None:
-        return search_deletion_sets(payload, tables, target_raw["data"], pool)
+        return search_deletion_sets(payload, tables, ev, target_raw["data"], pool)
     return minimal_hitting_sets(target_raw["witnesses"])
 
 
 def search_deletion_sets(
     payload: QueryIn,
     tables: dict[str, Table],
+    ev: Evaluator,
     target_data: tuple,
     pool: RecomputePool,
 ) -> list[frozenset[Label]]:
@@ -224,12 +225,16 @@ def search_deletion_sets(
     a structured 422 error carrying the pool statistics.
 
     The evaluator's candidate reduction is only proven exact for scans and
-    one-to-one joins; a label-dependency gate recomputes the plan once per
-    active-label singleton and widens the pool back to the full member-label
-    set when a singleton fails to kill the target (possible under joins:
-    one source label feeds several members whose value changes cancel, while
-    an inert zero-valued member keeps the target alive). Both the gate and
-    the exhaustive enumeration share the 10 000-recomputation budget.
+    one-to-one joins; a structural label-dependency gate simulates label
+    deletions directly on the target group's labeled members and admits an
+    inert-only label (zero/NULL sum member, non-extremal min/max member) only
+    when the remaining members can still sustain the full target row after
+    the active side is removed. This keeps arbitrary independent zero padding
+    out of the pool (a non-zero target cannot be sustained by zero-valued
+    survivors) while preserving a zero-valued self-join member that keeps a
+    zero target alive. The exhaustive enumeration still validates every
+    candidate deletion set by recomputing the whole plan; the gate and the
+    enumeration share the 10 000-recomputation budget.
     """
     from .provenance import MAX_RECOMPUTE_CALLS, MAX_RECOMPUTE_POOL
 
@@ -255,8 +260,13 @@ def search_deletion_sets(
     def kills_fn(d: frozenset[Label]) -> bool:
         return kills_target(payload.plan, tables, target_data, d)
 
+    def sustains_fn(d: frozenset[Label]) -> bool:
+        # Local structural replay of the target group (no whole-plan
+        # recomputation): exact for whether the target aggregate row remains.
+        return ev.target_group_sustains(pool, d)
+
     # The provisional (active-only) pool must fit the enumeration cap before
-    # any recomputation is spent on the dependency gate.
+    # any evaluation is spent on the dependency gate.
     if len(pool.reduced) > MAX_RECOMPUTE_POOL:
         e = SearchBudgetExceeded(
             "pool_too_large",
@@ -267,17 +277,14 @@ def search_deletion_sets(
 
     try:
         reduced_pool, outcomes, gate_calls = refine_reduced_pool(
-            pool.reduced,
-            pool.active_labels,
-            pool.full,
-            kills_fn,
+            pool,
+            sustains_fn,
             max_calls=MAX_RECOMPUTE_CALLS,
         )
     except SearchBudgetExceeded as e:
-        raise budget_error(e, pool.reduced, e.details.get("recompute_calls", 0))
+        raise budget_error(e, set(pool.reduced), e.details.get("recompute_calls", 0))
 
-    # A failed gate widens the pool back to the full member-label set, which
-    # itself must fit the enumeration cap.
+    # After the gate, the widened pool itself must fit the enumeration cap.
     if len(reduced_pool) > MAX_RECOMPUTE_POOL:
         e = SearchBudgetExceeded(
             "pool_too_large",

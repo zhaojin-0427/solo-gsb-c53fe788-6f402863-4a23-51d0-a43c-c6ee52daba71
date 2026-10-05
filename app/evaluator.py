@@ -51,18 +51,42 @@ class RecomputePool:
                aggregate values). Labels in ``full - active_labels`` support
                only inert members (e.g. zero-valued join pairs) and are the
                candidates for reduction;
-      reduced: labels the exact search actually enumerates. It starts equal
-               to ``active_labels``; the dependency gate
-               (``provenance.refine_reduced_pool``) widens it back to ``full``
-               when the inert labels may participate in a minimal deletion
-               set (as with a self-join, where one source label feeds several
-               members whose value changes cancel out);
+      reduced: labels the exact search initially enumerates — exactly
+               ``active_labels``. The structural dependency gate
+               (``provenance.refine_reduced_pool``) adds back an inert-only
+               label only when the remaining members can still sustain the
+               full target row (as with a self-join, where one source label
+               feeds several members whose value changes cancel while a
+               zero-valued self-join member keeps the zero target alive);
       group_member_count: number of input rows in the target group;
       active_member_count: number of those that can change at least one
                aggregate value of the target output.
+
+    The gate is a purely structural simulation (no whole-plan
+    recomputation); it needs the target group's labeled members plus the
+    aggregate specification:
+      member_rows:   the target group's aggregate-input members (labeled
+                     rows, i.e. witnesses are retained when projection merges
+                     equal-valued members);
+      member_active: per-member active flag;
+      agg_spec:      normalized (fn, column, alias) aggregate list;
+      input_names:   aggregate-input column names;
+      target_values: mapping alias -> target aggregate value.
     """
 
-    __slots__ = ("full", "reduced", "active_labels", "group_member_count", "active_member_count")
+    __slots__ = (
+        "full",
+        "reduced",
+        "active_labels",
+        "group_member_count",
+        "active_member_count",
+        "member_rows",
+        "member_active",
+        "agg_spec",
+        "input_names",
+        "target_values",
+        "group_by",
+    )
 
     def __init__(
         self,
@@ -71,12 +95,24 @@ class RecomputePool:
         group_member_count: int,
         active_member_count: int,
         active_labels: set[Label] | None = None,
+        member_rows: list[dict] | None = None,
+        member_active: list[bool] | None = None,
+        agg_spec: list[tuple[str, str | None, str]] | None = None,
+        input_names: list[str] | None = None,
+        target_values: dict[str, Any] | None = None,
+        group_by: list[str] | None = None,
     ):
         self.full = full
         self.reduced = reduced
         self.active_labels = active_labels if active_labels is not None else set(reduced)
         self.group_member_count = group_member_count
         self.active_member_count = active_member_count
+        self.member_rows = member_rows or []
+        self.member_active = member_active or []
+        self.agg_spec = agg_spec or []
+        self.input_names = input_names or []
+        self.target_values = target_values or {}
+        self.group_by = group_by or []
 
     @property
     def dropped_inert_count(self) -> int:
@@ -743,19 +779,69 @@ class Evaluator:
 
         # The reduced pool initially holds only the active members' labels.
         # Whether labels supporting inert members alone (e.g. a zero-valued
-        # self-join pair) may be dropped is decided afterwards by the label
-        # dependency gate in provenance.refine_reduced_pool: with joins one
-        # source label can feed several members whose value changes cancel
-        # (e.g. the +5 and -5 pairs sharing source row 1), so an inert member
-        # can be exactly what keeps the zero target alive after its active
-        # partners are removed.
+        # self-join pair) may be dropped is decided afterwards by the
+        # structural label-dependency gate in provenance.refine_reduced_pool:
+        # with joins one source label can feed several members whose value
+        # changes cancel (e.g. the +5 and -5 pairs sharing source row 1), so
+        # an inert member can be exactly what keeps the zero target alive
+        # after its active partners are removed. The gate simulates label
+        # deletions directly on the target group's labeled members below, so
+        # the pool carries them along with the aggregate specification.
         return RecomputePool(
             full=full_pool,
             reduced=reduced_pool,
             group_member_count=len(members),
             active_member_count=sum(active),
             active_labels=set(reduced_pool),
+            member_rows=members,
+            member_active=active,
+            agg_spec=aggs,
+            input_names=in_names,
+            target_values=values,
+            group_by=gb,
         )
+
+    def target_group_sustains(
+        self,
+        pool: RecomputePool,
+        removed: frozenset[Label],
+    ) -> bool:
+        """Structural replay of the target group's aggregate output.
+
+        Simulates deleting the source labels in *removed* on the target group
+        only (the rest of the plan cannot affect this group's aggregate row):
+        a member survives iff one of its witnesses is disjoint from the
+        removed labels. The surviving members are then re-aggregated, and the
+        result is compared against the full target row (group key plus every
+        aggregate value). No survivors is the same structural situation as an
+        empty aggregate input: the target row cannot be present.
+
+        This is the exact local replay of recomputing the whole plan for the
+        target group, and it is what the dependency gate uses to decide
+        whether an inert-only label may belong to a minimal deletion set —
+        zero/NULL members sustain a ``sum`` target of exactly zero but never a
+        non-zero target, which is why arbitrary padding zero labels stay out
+        of the candidate pool while a zero-valued self-join member keeping a
+        zero total alive keeps its label in.
+        """
+        surviving = [
+            m
+            for m in pool.member_rows
+            if any(w.isdisjoint(removed) for w in m["witnesses"])
+        ]
+        if not surviving:
+            return False
+        # Every surviving member carries the same group key (the pool was
+        # filtered to the target group); compare it defensively.
+        for g in pool.group_by:
+            gi = pool.input_names.index(g)
+            if surviving[0]["data"][gi] != pool.target_values[g]:
+                return False
+        for fn, col, asname in pool.agg_spec:
+            value, _ = self._agg_component(fn, col, pool.input_names, surviving)
+            if value != pool.target_values[asname]:
+                return False
+        return True
 
     def _agg_spec(self, node: dict):
         aggs = node.get("aggregates", [])
