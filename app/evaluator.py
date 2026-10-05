@@ -52,17 +52,30 @@ class RecomputePool:
                only inert members (e.g. zero-valued join pairs) and are the
                candidates for reduction;
       reduced: labels the exact search actually enumerates. It starts equal
-               to ``active_labels``; the dependency gate
-               (``provenance.refine_reduced_pool``) widens it back to ``full``
-               when the inert labels may participate in a minimal deletion
-               set (as with a self-join, where one source label feeds several
-               members whose value changes cancel out);
+               to ``active_labels``; the selective inert-label gate
+               (``Evaluator._selective_inert_widening``) adds back exactly
+               those inert-only labels that can occur in an inclusion-minimal
+               deletion set. Unlike the previous all-or-nothing dependency
+               gate it does NOT widen back to ``full``: padding zero
+               members that cannot sustain the target row on their own stay
+               reduced out, while the labels of the zero members that keep a
+               zero-valued target alive (the zero self-join pair case) are
+               restored;
       group_member_count: number of input rows in the target group;
       active_member_count: number of those that can change at least one
-               aggregate value of the target output.
+               aggregate value of the target output;
+      gate_candidates: number of active-label subsets examined by the
+               selective gate (diagnostic for the structured budget error).
     """
 
-    __slots__ = ("full", "reduced", "active_labels", "group_member_count", "active_member_count")
+    __slots__ = (
+        "full",
+        "reduced",
+        "active_labels",
+        "group_member_count",
+        "active_member_count",
+        "gate_candidates",
+    )
 
     def __init__(
         self,
@@ -71,12 +84,14 @@ class RecomputePool:
         group_member_count: int,
         active_member_count: int,
         active_labels: set[Label] | None = None,
+        gate_candidates: int = 0,
     ):
         self.full = full
         self.reduced = reduced
         self.active_labels = active_labels if active_labels is not None else set(reduced)
         self.group_member_count = group_member_count
         self.active_member_count = active_member_count
+        self.gate_candidates = gate_candidates
 
     @property
     def dropped_inert_count(self) -> int:
@@ -196,6 +211,27 @@ def prune(witnesses: Iterable[Witness]) -> set[Witness]:
     """Keep only inclusion-minimal witnesses."""
     uniq = set(witnesses)
     return {w for w in uniq if not any(o < w for o in uniq)}
+
+
+def label_can_hit_minimally(label: Label, edges: Iterable[Witness]) -> bool:
+    """True iff *label* occurs in some inclusion-minimal hitting set of the
+    witness hypergraph *edges*.
+
+    A label *z* is usable in a minimal transversal iff it has an incident
+    edge *e* such that no *z*-free edge is contained in *e*: that edge can
+    then be hit via *z* while the remaining *z*-free edges not contained in
+    *e* force additional labels, so *z* never becomes redundant. An incident
+    edge strictly containing a *z*-free edge is always better hit through the
+    smaller edge instead.
+    """
+    edges = list(edges)
+    for e in edges:
+        if label not in e:
+            continue
+        if not any(o < e for o in edges if label not in o):
+            return True
+    return False
+
 
 
 def cover_witnesses(rows: Iterable[dict]) -> set[Witness]:
@@ -640,51 +676,81 @@ class Evaluator:
         witness labels (any label supporting only inert members is dropped
         for now). That provisional reduction is exact when every group member
         depends on its own source labels — scans, filters, and one-to-one
-        joins: deleting one active label then removes exactly one active
-        member, so every active-label singleton already changes the target.
-        It is NOT exact in general under joins, where one source label can
-        feed several members: deleting it may remove a +5 member and a -5
-        member together (net zero) while a zero-valued self-join member
-        survives, leaving the target in place — the inert member's labels
-        then belong to a minimal deletion set after all. The caller
-        therefore validates the reduction with the label-dependency gate in
-        ``provenance.refine_reduced_pool`` (recomputing once per active
-        label) and widens the pool back to ``full`` when the gate fails.
+        joins. It is NOT exact in general under joins, where one source label
+        can feed several members: deleting it may remove a +5 member and a -5
+        member together (net zero) while an inert member (e.g. a zero-valued
+        self-join pair) survives, keeping the target in place — the inert
+        member's labels then belong to a minimal deletion set after all.
+
+        Rather than widening back to the *full* member-label set on the first
+        non-killing active singleton (the previous all-or-nothing gate, which
+        inflated the pool past the cap on arbitrary many independent padding
+        members and produced false 422s), ``_selective_inert_widening``
+        decides per inert-only label whether it can actually occur in an
+        inclusion-minimal deletion set, purely from the witness families and
+        an aggregate simulation (no plan recomputation): a label is restored
+        only when some active-label subset removes every active member while
+        the surviving inert members alone still reproduce the full target
+        row, and the label is essential to hitting those survivors.
         """
-        data = tuple(target_data)
+        # Walk filter/project nodes down to the aggregate producing the
+        # target, remembering the node chain for schema lookups.
+        agg_node = node
         while True:
-            t = node.get("type") if isinstance(node, dict) else None
+            t = agg_node.get("type") if isinstance(agg_node, dict) else None
             if t == "filter":
-                node = self._input(node)
+                agg_node = self._input(agg_node)
             elif t == "project":
-                spec = self._proj_cols(node)
-                out_values = dict(zip([asname for _, asname in spec], data))
-                in_names = self.schema(self._input(node))
-                mapped = {name: self._UNMAPPED for name in in_names}
-                for frm, asname in spec:
-                    mapped[frm] = out_values[asname]
-                data = tuple(mapped[name] for name in in_names)
-                node = self._input(node)
+                agg_node = self._input(agg_node)
             elif t == "aggregate":
                 break
             else:
                 return None
 
-        gb = node.get("group_by", [])
-        aggs = self._agg_spec(node)
+        gb = agg_node.get("group_by", [])
+        aggs = self._agg_spec(agg_node)
         sum_cols = [col for fn, col, _ in aggs if fn == "sum"]
         if not sum_cols:
             return None
-        out_schema = self._agg_schema(node)
+        out_schema = self._agg_schema(agg_node)
+        # Take the target aggregate values from the produced row matching the
+        # target group key rather than from the possibly projected
+        # target_data: project walks can leave columns unmapped.
+        in_names = self.schema(self._input(agg_node))
+        key_idx = [in_names.index(g) for g in gb]
+        agg_rows = self.eval(agg_node)
+        agg_idx = {r["data"][:len(gb)]: r for r in agg_rows}
+
+        # Recover the group key from the (projected) target data by walking
+        # the node chain in reverse; unmapped group keys abort the path.
+        data = tuple(target_data)
+        walk = node
+        while walk is not agg_node:
+            t = walk.get("type")
+            if t == "filter":
+                walk = self._input(walk)
+            elif t == "project":
+                spec = self._proj_cols(walk)
+                out_values = dict(zip([a for _, a in spec], data))
+                inn = self.schema(self._input(walk))
+                mapped = {name: self._UNMAPPED for name in inn}
+                for frm, asname in spec:
+                    mapped[frm] = out_values[asname]
+                data = tuple(mapped[name] for name in inn)
+                walk = self._input(walk)
         values = dict(zip(out_schema, data))
         key = tuple(values[g] for g in gb)
         if any(v is self._UNMAPPED for v in key):
             return None
-        in_names = self.schema(self._input(node))
-        gi = [in_names.index(g) for g in gb]
+        target_agg = agg_idx.get(key)
+        if target_agg is None:
+            return None
+        target_values = dict(zip(out_schema, target_agg["data"]))
+
+        gi = key_idx
         members = [
             r
-            for r in self.eval(self._input(node))
+            for r in self.eval(self._input(agg_node))
             if tuple(r["data"][i] for i in gi) == key
         ]
         mixed = False
@@ -702,7 +768,7 @@ class Evaluator:
         # one target aggregate value (see the class docstring).
         active = [False] * len(members)
         for fn, col, asname in aggs:
-            target = values[asname]
+            target = target_values[asname]
             if fn == "count":
                 if col is None or col == "*":
                     for i in range(len(members)):
@@ -727,6 +793,8 @@ class Evaluator:
 
         full_pool: set[Label] = set()
         reduced_pool: set[Label] = set()
+        active_members: list[dict] = []
+        inert_members: list[dict] = []
         for i, r in enumerate(members):
             member_labels: set[Label] = set()
             for w in r["witnesses"]:
@@ -734,6 +802,9 @@ class Evaluator:
             full_pool.update(member_labels)
             if active[i]:
                 reduced_pool.update(member_labels)
+                active_members.append(r)
+            else:
+                inert_members.append(r)
 
         # Defensive: an empty active pool would mean no active label at all,
         # but a mixed-sign sum guarantees non-zero members exist; leave the
@@ -741,21 +812,327 @@ class Evaluator:
         if not reduced_pool:
             return None
 
-        # The reduced pool initially holds only the active members' labels.
-        # Whether labels supporting inert members alone (e.g. a zero-valued
-        # self-join pair) may be dropped is decided afterwards by the label
-        # dependency gate in provenance.refine_reduced_pool: with joins one
-        # source label can feed several members whose value changes cancel
-        # (e.g. the +5 and -5 pairs sharing source row 1), so an inert member
-        # can be exactly what keeps the zero target alive after its active
-        # partners are removed.
+        # When even the active-only pool exceeds the enumeration cap the gate
+        # cannot shrink it, so skip the structural analysis; the caller raises
+        # the structured pool-too-large error.
+        from .provenance import MAX_RECOMPUTE_POOL
+
+        if len(reduced_pool) > MAX_RECOMPUTE_POOL:
+            return RecomputePool(
+                full=full_pool,
+                reduced=set(reduced_pool),
+                group_member_count=len(members),
+                active_member_count=len(active_members),
+                active_labels=set(reduced_pool),
+                gate_candidates=0,
+            )
+
+        # Selective inert-label gate: restore exactly the inert-only labels
+        # that can participate in an inclusion-minimal deletion set. The
+        # provisional active-only pool is enumerated over at most 20 labels,
+        # so the structural analysis over it is bounded.
+        widened, examined = self._selective_inert_widening(
+            aggs=aggs,
+            in_names=in_names,
+            target_values=target_values,
+            active_members=active_members,
+            inert_members=inert_members,
+            active_pool=reduced_pool,
+            full_pool=full_pool,
+        )
         return RecomputePool(
             full=full_pool,
-            reduced=reduced_pool,
+            reduced=widened,
             group_member_count=len(members),
-            active_member_count=sum(active),
+            active_member_count=len(active_members),
             active_labels=set(reduced_pool),
+            gate_candidates=examined,
         )
+
+    # -- selective inert-label widening (exact structural gate) -------------
+
+    # Upper bound on active-label masks examined per target. The structural
+    # analysis costs no plan recomputation; beyond the bound the gate falls
+    # back to the conservative full member-label pool (which then has to fit
+    # the 20-label enumeration cap, exactly like any reduced pool).
+    _GATE_CANDIDATE_LIMIT = 200_000
+
+    def _selective_inert_widening(
+        self,
+        *,
+        aggs: list[tuple[str, str | None, str]],
+        in_names: list[str],
+        target_values: dict[str, Any],
+        active_members: list[dict],
+        inert_members: list[dict],
+        active_pool: set[Label],
+        full_pool: set[Label],
+    ) -> tuple[set[Label], int]:
+        """Decide which inert-only labels the exact search must enumerate.
+
+        A label is inert-only when it occurs in no active member's witnesses.
+        Such a label *z* belongs to an inclusion-minimal deletion set
+        ``D = A ∪ Z`` (``A`` active labels, ``Z`` inert-only labels) exactly
+        when there is an active mask ``A`` for which:
+
+        1. deleting ``A`` removes **every** active member — otherwise the
+           surviving active members alone already determine the aggregate
+           values and the inert labels in ``D`` are redundant;
+        2. the **inert members surviving ``A`` alone still reproduce the full
+           target row** — otherwise the target is already gone after ``A``
+           and again no inert label is needed;
+        3. every surviving inert member has an ``A``-disjoint witness
+           containing an inert-only label (some subset ``Z`` has to be able
+           to kill them all);
+        4. ``A`` is essential in at least one of its active labels: dropping
+           that label must leave a group (resurrected active members plus the
+           inert members then surviving) that *can still take the target
+           values* — otherwise ``A`` itself is redundant for the emptiness
+           kill and no minimal set has this active part; and
+        5. *z* lies in some inclusion-minimal hitting set of the surviving
+           inert members' inert-only witness edges (it must be able to carry
+           its share of the kill without a dominating smaller edge).
+
+        Conditions 1–4 are evaluated purely structurally: a labeled member
+        survives a label deletion iff one of its witnesses is disjoint from
+        the deleted labels, and aggregate values are simulated over the
+        survivors. This is exact for scan/filter/project/join inputs and
+        needs no whole-plan recomputation. Returns ``(widened pool, masks
+        examined)``.
+        """
+        # Local import: provenance imports evaluator types at module load.
+        from .provenance import minimal_hitting_sets
+
+        active_labels = sorted(active_pool, key=lambda lab: (lab[0], lab[1]))
+        index = {lab: i for i, lab in enumerate(active_labels)}
+        n = len(active_labels)
+
+        def mask_of_witness(w: Witness) -> int:
+            m = 0
+            for lab in w:
+                j = index.get(lab)
+                if j is not None:
+                    m |= 1 << j
+            return m
+
+        active_edges = [
+            frozenset(mask_of_witness(w) for w in m["witnesses"])
+            for m in active_members
+        ]
+        inert_edges = [
+            (m, frozenset(mask_of_witness(w) for w in m["witnesses"]))
+            for m in inert_members
+        ]
+
+        def survives(member_edges: frozenset[int], mask: int) -> bool:
+            return any((e & mask) == 0 for e in member_edges)
+
+        def survivor_rows(edges, mask):
+            return [m for m, es in edges if survives(es, mask)]
+
+        def kills_all_active(mask: int) -> bool:
+            return all(not survives(es, mask) for es in active_edges)
+
+        def agg_values(rows: list[dict]):
+            """Aggregate tuple aligned to ``aggs``; None iff input is empty."""
+            if not rows:
+                return None
+            out = []
+            for fn, col, _ in aggs:
+                if fn == "count":
+                    if col is None or col == "*":
+                        out.append(len(rows))
+                    else:
+                        ci = in_names.index(col)
+                        out.append(sum(1 for r in rows if r["data"][ci] is not None))
+                    continue
+                ci = in_names.index(col)
+                vals = [r["data"][ci] for r in rows if r["data"][ci] is not None]
+                if fn == "sum":
+                    out.append(sum(vals) if vals else None)
+                elif fn == "min":
+                    out.append(min(vals) if vals else None)
+                else:
+                    out.append(max(vals) if vals else None)
+            return tuple(out)
+
+        target_tuple = tuple(target_values[a] for _, _, a in aggs)
+
+        # Enumerate active masks that kill every active member. Every such
+        # mask is a superset of at least one minimal hitting set of the
+        # active witness edges, so for each minimal cover enumerate its
+        # supersets by DFS (each mask is processed at most once), with a hard
+        # bound on processed masks: beyond it the gate conservatively widens
+        # to the full member-label pool.
+        edge_label_sets: set[Witness] = set()
+        for es in active_edges:
+            for e in es:
+                edge_label_sets.add(
+                    frozenset(active_labels[j] for j in range(n) if e & (1 << j))
+                )
+
+        examined = 0
+        overflow = False
+        qualifying: set[int] = set()
+        processed: set[int] = set()
+
+        def examine(mask: int) -> bool:
+            nonlocal examined, overflow
+            if mask in processed:
+                return overflow
+            processed.add(mask)
+            examined += 1
+            if examined > self._GATE_CANDIDATE_LIMIT:
+                overflow = True
+                return overflow
+            if kills_all_active(mask):
+                # Conditions 1 and 2.
+                inert_survivors = survivor_rows(inert_edges, mask)
+                if inert_survivors and agg_values(inert_survivors) == target_tuple:
+                    qualifying.add(mask)
+            return overflow
+
+        # Deterministic order of minimal covers for stable diagnostics.
+        minimal_covers = sorted(
+            minimal_hitting_sets(edge_label_sets),
+            key=lambda cover: sorted((lab[0], lab[1]) for lab in cover),
+        )
+        for cover in minimal_covers:
+            base = 0
+            for lab in cover:
+                base |= 1 << index[lab]
+
+            def grow(mask: int, start: int) -> None:
+                if examine(mask) or overflow:
+                    return
+                for j in range(start, n):
+                    bit = 1 << j
+                    if mask & bit:
+                        continue
+                    grow(mask | bit, j + 1)
+                    if overflow:
+                        return
+
+            grow(base, 0)
+            if overflow:
+                break
+
+        if overflow:
+            # Structural analysis could not finish; conservatively widen to
+            # the full member-label pool (still subject to the cap upstream).
+            return set(full_pool), examined
+
+        inert_only = full_pool - active_pool
+        if not inert_only or not qualifying:
+            return set(active_pool), examined
+
+        widened: set[Label] = set(active_pool)
+        for mask in qualifying:
+            # Condition 4: at least one active bit must be essential. With
+            # that bit dropped, the group (resurrected active members plus
+            # every inert member that then survives) must be able to take the
+            # target values while staying non-empty.
+            essential = False
+            for j in range(n):
+                bit = 1 << j
+                if not (mask & bit):
+                    continue
+                reduced = mask & ~bit
+                resurrected = [
+                    m
+                    for k, m in enumerate(active_members)
+                    if survives(active_edges[k], reduced)
+                ]
+                inert_surv = survivor_rows(inert_edges, reduced)
+                if self._target_reproducible(
+                    aggs, in_names, target_tuple, resurrected, inert_surv
+                ):
+                    essential = True
+                    break
+            if not essential:
+                continue
+
+            # Condition 3: the inert members surviving A must all be killable
+            # by inert-only labels. Such a member is killed iff EVERY one of
+            # its A-disjoint witnesses is hit; if any such witness still
+            # contains an active label (shared with an active member but not
+            # selected in A), no inert-only Z can remove the member and this
+            # active part cannot occur in a minimal deletion set. Otherwise
+            # the flat family of those witnesses is exactly what Z must
+            # transversal-hit.
+            required_edges: set[Witness] = set()
+            ruled_out = False
+            for m in survivor_rows(inert_edges, mask):
+                disjoint = [
+                    w for w in m["witnesses"] if (mask_of_witness(w) & mask) == 0
+                ]
+                if any(not w <= inert_only for w in disjoint):
+                    ruled_out = True
+                    break
+                required_edges |= set(disjoint)
+            if ruled_out or not required_edges:
+                continue
+
+            # Condition 5: restore the inert-only labels that occur in some
+            # inclusion-minimal hitting set of the required edges.
+            for z in inert_only:
+                if label_can_hit_minimally(z, frozenset(required_edges)):
+                    widened.add(z)
+        return widened, examined
+
+    @staticmethod
+    def _target_reproducible(
+        aggs: list[tuple[str, str | None, str]],
+        in_names: list[str],
+        target_tuple: tuple,
+        resurrected_active: list[dict],
+        inert_survivors: list[dict],
+    ) -> bool:
+        """Whether keeping every resurrected active member and an arbitrary
+        subset of the inert survivors lets the group take the target values.
+
+        Inert members are zero/NULL (sum, count(col)), non-extremal
+        (min/max), or count(*) padding, so per aggregate this is a simple
+        value/range check over the resurrected active values.
+        """
+        if not resurrected_active and not inert_survivors:
+            return False
+        for k, (fn, col, _) in enumerate(aggs):
+            target = target_tuple[k]
+            if fn == "count":
+                if col is None or col == "*":
+                    lo = len(resurrected_active)
+                    hi = lo + len(inert_survivors)
+                else:
+                    ci = in_names.index(col)
+                    lo = sum(
+                        1 for r in resurrected_active if r["data"][ci] is not None
+                    )
+                    hi = lo + sum(
+                        1 for r in inert_survivors if r["data"][ci] is not None
+                    )
+                if not (lo <= target <= hi):
+                    return False
+                continue
+            ci = in_names.index(col)
+            av = [r["data"][ci] for r in resurrected_active if r["data"][ci] is not None]
+            iv = [r["data"][ci] for r in inert_survivors if r["data"][ci] is not None]
+            if fn == "sum":
+                # Inert non-NULL values are 0, so they never move the sum.
+                if (sum(av) if av else None) != target:
+                    return False
+            elif fn == "min":
+                if target is None or not av or min(av) != target:
+                    return False
+                # Inert values are non-extremal; none may go below target.
+                if iv and min(iv) < target:
+                    return False
+            else:  # max
+                if target is None or not av or max(av) != target:
+                    return False
+                if iv and max(iv) > target:
+                    return False
+        return True
 
     def _agg_spec(self, node: dict):
         aggs = node.get("aggregates", [])

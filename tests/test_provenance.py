@@ -1,12 +1,11 @@
 """Unit tests for minimal hitting sets and witness construction."""
 import pytest
 
-from app.evaluator import Evaluator, Table
+from app.evaluator import Evaluator, Table, label_can_hit_minimally
 from app.provenance import (
     SearchBudgetExceeded,
     minimal_deletion_sets_by_recompute,
     minimal_hitting_sets,
-    refine_reduced_pool,
 )
 
 
@@ -103,50 +102,30 @@ def test_search_budget_recompute_calls():
     assert exc.value.details["recompute_calls"] == 6
 
 
-def test_refine_pool_gate_passes_when_every_active_singleton_kills():
-    # One-to-one join style: each active label kills on its own, so the
-    # inert-only labels (the zero pairs) stay reduced out.
-    active = {L("t", 1), L("t", 2)}
-    full = active | {L("z", i) for i in range(9)}
-    pool, outcomes, calls = refine_reduced_pool(
-        active, active, full, lambda d: True
+def test_label_can_hit_minimally_basic():
+    # z occurs in a minimal transversal iff some incident edge is not
+    # dominated by a z-free edge.
+    z = L("t", 0)
+    a, b, c = L("t", 1), L("t", 2), L("t", 3)
+    # Edge {z,a} with no smaller z-free edge: z is usable on its own.
+    assert label_can_hit_minimally(z, [frozenset({z, a})])
+    # Edge {z,a} strictly contains the z-free edge {a}: z is dominated.
+    assert not label_can_hit_minimally(
+        z, [frozenset({z, a}), frozenset({a})]
     )
-    assert pool == active
-    assert calls == 2
-    assert outcomes == {
-        frozenset([L("t", 1)]): True,
-        frozenset([L("t", 2)]): True,
-    }
-
-
-def test_refine_pool_gate_widens_on_nonsingleton_label():
-    # Self-join style: label t1 alone does not kill (its +5/-5 members
-    # cancel); the gate must stop immediately and widen back to the full
-    # pool, preserving the inert zero-pair labels.
-    active = {L("t", 1), L("t", 2), L("t", 3)}
-    inert = {L("t", 4)}
-    full = active | inert
-
-    def kills(d):
-        # t1 removes both cancelling members -> not killing; t2/t3 do.
-        if d == frozenset([L("t", 1)]):
-            return False
-        return True
-
-    pool, outcomes, calls = refine_reduced_pool(active, active, full, kills)
-    assert pool == full
-    assert calls == 1
-    assert outcomes == {frozenset([L("t", 1)]): False}
-
-
-def test_refine_pool_recomputes_count_toward_budget():
-    active = {L("t", 1), L("t", 2)}
-    with pytest.raises(SearchBudgetExceeded) as exc:
-        refine_reduced_pool(active, active, active, lambda d: True, max_calls=1)
-    assert exc.value.reason == "recompute_budget"
-    # The first call fits the budget; the second (which would exceed it)
-    # raises — the same convention as minimal_deletion_sets_by_recompute.
-    assert exc.value.details["recompute_calls"] == 2
+    # The 18 independent zero self-pairs: each singleton edge makes its own
+    # label usable, so every zero label is independently relevant.
+    edges = [frozenset({L("t", i)}) for i in range(1, 20)]
+    for i in range(1, 20):
+        assert label_can_hit_minimally(L("t", i), edges)
+    # A shared label over two edges plus a dominated third edge: still usable
+    # via the undominated {a,c} edge (the minimal transversal is {a,b}).
+    assert label_can_hit_minimally(a, [frozenset({a, b}), frozenset({b}), frozenset({a, c})])
+    # When every a-edge dominates an a-free edge, a is never needed.
+    assert not label_can_hit_minimally(
+        a,
+        [frozenset({a, b}), frozenset({b}), frozenset({a, c}), frozenset({c})],
+    )
 
 
 def test_search_reuses_gate_outcomes():
@@ -469,11 +448,13 @@ def test_mixed_sign_sum_pool_reduction_count_star():
     assert len(pool.reduced) == 13
 
 
-def test_mixed_sign_sum_pool_self_join_keeps_zero_pair_in_full_pool():
+def test_mixed_sign_sum_pool_self_join_selective_gate_keeps_zero_pair():
     """Self-join: the zero-valued row4/row4 member is inert by value, so the
-    provisional reduced pool excludes ledger[4] — but it must remain in the
-    full pool so the dependency gate can widen the search (label 1 alone
-    removes the +5 and -5 members together and does not kill)."""
+    provisional active pool excludes ledger[4]; the selective inert-label
+    gate restores exactly ledger[4] (the zero self-pair that keeps the zero
+    target alive after deleting ledger[1] removes the +5/-5 members together).
+    Independent padding zero members that cannot sustain the target stay
+    reduced out (see the 18-zero-pair regression test in test_api.py)."""
     tables = [
         {
             "table": "ledger",
@@ -516,7 +497,11 @@ def test_mixed_sign_sum_pool_self_join_keeps_zero_pair_in_full_pool():
     assert pool is not None
     assert pool.full == {L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)}
     assert pool.active_labels == {L("ledger", 1), L("ledger", 2), L("ledger", 3)}
-    assert pool.reduced == pool.active_labels
+    # The selective gate widened exactly by the zero self-pair label.
+    assert pool.reduced == {
+        L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)
+    }
+    assert pool.dropped_inert_count == 0
     assert pool.group_member_count == 3
     assert pool.active_member_count == 2
 

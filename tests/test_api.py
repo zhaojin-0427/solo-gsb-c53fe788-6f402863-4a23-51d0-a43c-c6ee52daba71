@@ -681,6 +681,178 @@ def test_self_join_sum_counterfactual_includes_zero_self_pair(client):
     assert r2.headers["x-idempotent-replay"] == "true"
 
 
+def test_self_join_sum_counterfactual_zero_padding_not_widened(client):
+    """Regression for the POST /query self-join false-positive 422.
+
+    After projection (right amount only) the filtered self-join has four
+    distinct members: row1+row2 = +5, row1+row3 = -5, row4+row4 = +7, and a
+    single merged zero member carrying 18 independent zero self-pairs
+    (rows 5..22). Target total=7. Deleting row 1 alone removes the +5/-5
+    members but the +7 self-join member sustains the target, so the old
+    all-or-nothing dependency gate widened the pool to ALL 22 member labels
+    and wrongly answered 422 (pool > 20). The selective gate must recognize
+    that the 18 zero pairs cannot sustain total=7 and leave them reduced out;
+    the exact search returns the three singleton sets with recomputed totals
+    2 / 12 / 0.
+    """
+    rows = [
+        {"id": 1, "k": 1, "amount": 0},
+        {"id": 2, "k": 1, "amount": 5},
+        {"id": 3, "k": 1, "amount": -5},
+        {"id": 4, "k": 2, "amount": 7},
+    ]
+    rows += [{"id": i, "k": i, "amount": 0} for i in range(5, 23)]
+    predicate = {"or": [
+        {
+            "and": [
+                {"column": "id", "op": "=", "value": 1},
+                {"column": "right.id", "op": ">=", "value": 2},
+            ]
+        },
+        {"column": "id", "op": "=", "value": 4},
+    ]}
+    predicate["or"] += [
+        {"column": "id", "op": "=", "value": i} for i in range(5, 23)
+    ]
+    req = {
+        "idempotency_key": "key-selfjoin-mixed-7-padded",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "int"},
+                    {"name": "k", "type": "int"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "project",
+                "columns": [{"from": "right.amount", "as": "amt"}],
+                "input": {
+                    "type": "filter",
+                    "predicate": predicate,
+                    "input": {
+                        "type": "join",
+                        "left": {"type": "scan", "table": "ledger"},
+                        "right": {"type": "scan", "table": "ledger"},
+                        "on": [{"left": "k", "right": "k"}],
+                    },
+                },
+            },
+            "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+        },
+        "explain": {"row": {"total": 7}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    target = body["result"]["rows"][0]
+    assert target["row"] == {"total": 7}
+    # Only +7 minimally sums to 7: the merged zero pair and the cancelling
+    # members do not enter the provenance; only ledger[4] is symbolized.
+    assert target["provenance"]["labels_structured"] == [["ledger[4]"]]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_count"] == 3
+    assert cf["minimal_deletion_sets"] == [
+        ["ledger[2]"],
+        ["ledger[3]"],
+        ["ledger[4]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("ledger[2]",)]["result"]["rows"] == [{"total": 2}]
+    assert by_delete[("ledger[3]",)]["result"]["rows"] == [{"total": 12}]
+    assert by_delete[("ledger[4]",)]["result"]["rows"] == [{"total": 0}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    # Idempotent replay stays byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_self_join_sum_zero_target_zero_pairs_still_422(client):
+    """The selective gate must not become over-aggressive: when the target is
+    total=0 the 18 independent zero self-pairs genuinely sustain the target
+    after deleting ledger[1] (the +5/-5 members cancel), so every zero label
+    is a real candidate. 18 zero labels + 4 active labels exceed the 20-label
+    pool cap and the exact search must still answer a structured 422 — never
+    an approximate answer and never silently dropping the multi-label
+    emptiness-kill scheme.
+    """
+    rows = [
+        {"id": 1, "k": 1, "amount": 0},
+        {"id": 2, "k": 1, "amount": 5},
+        {"id": 3, "k": 1, "amount": -5},
+        {"id": 4, "k": 4, "amount": 0},
+    ]
+    rows += [{"id": i, "k": i, "amount": 0} for i in range(5, 23)]
+    predicate = {"or": [
+        {
+            "and": [
+                {"column": "id", "op": "=", "value": 1},
+                {"column": "right.id", "op": ">=", "value": 2},
+            ]
+        },
+    ]}
+    predicate["or"] += [
+        {"column": "id", "op": "=", "value": i} for i in range(4, 23)
+    ]
+    req = {
+        "idempotency_key": "key-selfjoin-mixed-0-padded-422",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["id"],
+                "columns": [
+                    {"name": "id", "type": "int"},
+                    {"name": "k", "type": "int"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {
+                "type": "project",
+                "columns": [{"from": "right.amount", "as": "amt"}],
+                "input": {
+                    "type": "filter",
+                    "predicate": predicate,
+                    "input": {
+                        "type": "join",
+                        "left": {"type": "scan", "table": "ledger"},
+                        "right": {"type": "scan", "table": "ledger"},
+                        "on": [{"left": "k", "right": "k"}],
+                    },
+                },
+            },
+            "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+        },
+        "explain": {"row": {"total": 0}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 422, r1.text
+    err = r1.json()["error"]
+    assert err["code"] == "COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED"
+    assert err["details"]["reduced_pool_size"] == 22
+    assert err["details"]["pool_limit"] == 20
+    assert err["details"]["dropped_inert_label_count"] == 0
+    assert err["details"]["dependency_gate_recomputes"] == 0
+    assert err["details"]["selective_gate_candidates"] >= 1
+    assert "counterfactual" not in r1.json()
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 422
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
 def test_one_to_one_join_zero_padding_does_not_inflate_pool(client):
     """5, -5 and nine 0s over a one-to-one inner join: the zero pairs are
     reduced out of the candidate pool (each active-label singleton already

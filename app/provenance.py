@@ -26,7 +26,7 @@ import itertools
 from typing import Any, Callable, Iterable
 
 from .evaluator import Label, Witness
-from .values import tuple_sort_key, value_sort_key
+from .values import value_sort_key
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +133,12 @@ def minimal_hitting_sets(witnesses: set[Witness]) -> list[frozenset[Label]]:
 # Recomputation-based minimal deletion sets (non-monotone sum)
 # ---------------------------------------------------------------------------
 
-# After candidate reduction (see Evaluator.mixed_sign_sum_pool) the pool only
-# contains source rows that can change at least one aggregate value of the
-# target group; even so, exhaustive subset enumeration is 2**n, so the
-# reduced pool is capped. Beyond the cap the request fails with a structured
-# budget error — a hitting-set approximation is never returned as success.
+# After candidate reduction (see Evaluator.mixed_sign_sum_pool and its
+# selective inert-label gate) the pool only contains source rows that can
+# participate in a minimal deletion set; even so, exhaustive subset
+# enumeration is 2**n, so the reduced pool is capped. Beyond the cap the
+# request fails with a structured budget error — a hitting-set approximation
+# is never returned as success.
 MAX_RECOMPUTE_POOL = 20
 
 # Cap on whole-plan recomputations per counterfactual search. Every candidate
@@ -159,70 +160,6 @@ class SearchBudgetExceeded(Exception):
         super().__init__(reason)
         self.reason = reason
         self.details = details
-
-
-def refine_reduced_pool(
-    pool_labels: Iterable[Label],
-    active_labels: Iterable[Label],
-    full_labels: Iterable[Label],
-    kills: Callable[[frozenset[Label]], bool],
-    *,
-    max_calls: int = MAX_RECOMPUTE_CALLS,
-) -> tuple[set[Label], dict[frozenset[Label], bool], int]:
-    """Label-dependency gate for inert-label candidate reduction.
-
-    ``pool_labels`` is the provisional reduced pool (labels of active
-    members); ``full_labels`` adds labels that support only inert members
-    (e.g. a zero-valued join pair). Dropping the inert-only labels is proven
-    safe exactly when deleting **each** active label on its own already
-    removes the full target row:
-
-    * inert-only deletions never remove an active member (their labels occur
-      in no active member's witnesses) and an inert member changes no
-      aggregate value, so an inert-only deletion cannot kill the target;
-    * if every active-label singleton kills, any deletion set containing an
-      inert label also contains an active singleton (the set must remove at
-      least one active member to change the target), and is therefore not
-      inclusion-minimal.
-
-    Under scans / filters / one-to-one joins every active label owns its
-    members, so each active singleton changes a mixed-sign sum and the gate
-    passes — arbitrary many zero/NULL members stay reduced out. Under joins
-    one label may feed several members whose changes cancel (e.g. the +5 and
-    -5 pairs sharing source row 1, with a zero-valued row-4 self-join kept
-    alive): its singleton does NOT kill, the gate fails, and the pool is
-    widened back to ``full_labels`` so exhaustive search can find the
-    two-label sets (e.g. ``{row1, row4}``).
-
-    Returns ``(pool, outcomes, calls)``: the pool to enumerate, the singleton
-    kill outcomes (reused by the search without recomputation), and the
-    number of recomputations spent. Raises ``SearchBudgetExceeded`` if the
-    gate itself exceeds ``max_calls`` recomputations.
-    """
-    pool = set(pool_labels)
-    active = sorted(set(active_labels), key=label_sort_key)
-    outcomes: dict[frozenset[Label], bool] = {}
-    calls = 0
-    for lab in active:
-        singleton = frozenset({lab})
-        calls += 1
-        if calls > max_calls:
-            raise SearchBudgetExceeded(
-                "recompute_budget",
-                reduced_pool_size=len(pool),
-                recompute_calls=calls,
-                recompute_budget_limit=max_calls,
-            )
-        result = kills(singleton)
-        outcomes[singleton] = result
-        if not result:
-            # An active label whose deletion does not kill the target: some
-            # minimal deletion set must combine it with further labels. Those
-            # further labels may be the inert-only ones, so keep the full
-            # pool. (The remaining active singletons still have to be tested
-            # by the caller as ordinary candidates.)
-            return set(full_labels), outcomes, calls
-    return pool, outcomes, calls
 
 
 def minimal_deletion_sets_by_recompute(
@@ -249,11 +186,12 @@ def minimal_deletion_sets_by_recompute(
 
     Raises ``SearchBudgetExceeded`` when the reduced pool exceeds
     ``max_pool_size`` or when more than ``max_calls`` recomputations would be
-    needed; no partial/approximate answer is returned. ``known`` carries
-    candidate outcomes already computed (e.g. the singleton outcomes from
-    ``refine_reduced_pool``) so they are not recomputed; those prior
-    recomputations are not part of ``max_calls`` — the caller accounts for
-    them against the shared budget.
+    needed; no partial/approximate answer is returned. ``known`` optionally
+    carries candidate outcomes decided without a plan recomputation (the
+    selective gate decides pools structurally but does not pre-seed
+    outcomes); cached candidates cost no recomputation and those prior
+    outcomes are outside ``max_calls`` — the caller accounts for any shared
+    budget itself.
     """
     labels = sorted(set(pool), key=label_sort_key)
     if len(labels) > max_pool_size:
