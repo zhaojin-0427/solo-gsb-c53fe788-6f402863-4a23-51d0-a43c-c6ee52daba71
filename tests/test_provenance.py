@@ -1,0 +1,549 @@
+"""Unit tests for minimal hitting sets and witness construction."""
+import pytest
+
+from app.evaluator import Evaluator, Table
+from app.provenance import (
+    SearchBudgetExceeded,
+    minimal_deletion_sets_by_recompute,
+    minimal_hitting_sets,
+    refine_reduced_pool,
+)
+
+
+def L(table, *pk):
+    return (table, pk)
+
+
+def test_hitting_sets_basic():
+    witnesses = {frozenset([L("t", 1), L("t", 2)]), frozenset([L("t", 2), L("t", 3)])}
+    hs = minimal_hitting_sets(witnesses)
+    assert frozenset([L("t", 2)]) in hs
+    assert frozenset([L("t", 1), L("t", 3)]) in hs
+    assert len(hs) == 2
+
+
+def test_hitting_sets_nested():
+    witnesses = {
+        frozenset([L("t", 1), L("t", 2)]),
+        frozenset([L("t", 2), L("t", 3)]),
+        frozenset([L("t", 3), L("t", 4)]),
+    }
+    hs = minimal_hitting_sets(witnesses)
+    # {2,3}, {1,3}, {2,4}
+    assert len(hs) == 3
+    for h in hs:
+        for w in witnesses:
+            assert h & w
+        assert not any(o < h for o in hs)
+
+
+def test_single_witness():
+    w = frozenset([L("a", "x"), L("b", "y")])
+    hs = minimal_hitting_sets(witnesses={w})
+    assert set(hs) == {frozenset([L("a", "x")]), frozenset([L("b", "y")])}
+
+
+def test_deletion_sets_by_recompute():
+    pool = {L("t", 1), L("t", 2)}
+    # Every non-empty set kills: the singletons are the minimal solutions.
+    sols = minimal_deletion_sets_by_recompute(pool, lambda d: len(d) > 0)
+    assert sols == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
+    # Only pairs kill: the single pair is the unique minimal solution.
+    sols = minimal_deletion_sets_by_recompute(pool, lambda d: len(d) >= 2)
+    assert sols == [frozenset([L("t", 1), L("t", 2)])]
+    # Non-upward-closed kills (only the exact singleton works): supersets of
+    # a solution are skipped, and the solution is still reported.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: d == frozenset([L("t", 1)])
+    )
+    assert sols == [frozenset([L("t", 1)])]
+
+
+def test_non_killing_set_must_not_prune_its_supersets():
+    """Mixed-sign sums are non-monotone: a set that fails to kill the target
+    says nothing about its supersets, so the search still has to test them."""
+    pool = {L("t", 1), L("t", 2), L("t", 3)}
+    # Only exact pairs kill; the singletons (and the empty set) do not.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: len(d) == 2
+    )
+    assert sols == [
+        frozenset([L("t", 1), L("t", 2)]),
+        frozenset([L("t", 1), L("t", 3)]),
+        frozenset([L("t", 2), L("t", 3)]),
+    ]
+    # Every odd-sized candidate kills, even sizes do not: supersets of a
+    # failing singleton (the triples) must still be enumerated.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: len(d) % 2 == 1
+    )
+    assert sols == [
+        frozenset([L("t", 1)]),
+        frozenset([L("t", 2)]),
+        frozenset([L("t", 3)]),
+    ]
+
+
+def test_search_budget_pool_too_large():
+    # Pools beyond the enumeration cap raise a structured budget error
+    # instead of returning None (no approximate hitting-set answer).
+    big = {L("t", i) for i in range(21)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        minimal_deletion_sets_by_recompute(big, lambda d: True)
+    assert exc.value.reason == "pool_too_large"
+    assert exc.value.details["reduced_pool_size"] == 21
+
+
+def test_search_budget_recompute_calls():
+    # A call cap lower than the 2**n enumeration surfaces mid-search.
+    big = {L("t", i) for i in range(10)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        minimal_deletion_sets_by_recompute(big, lambda d: False, max_calls=5)
+    assert exc.value.reason == "recompute_budget"
+    assert exc.value.details["recompute_calls"] == 6
+
+
+def test_refine_pool_gate_passes_when_every_active_singleton_kills():
+    # One-to-one join style: each active label kills on its own, so the
+    # inert-only labels (the zero pairs) stay reduced out.
+    active = {L("t", 1), L("t", 2)}
+    full = active | {L("z", i) for i in range(9)}
+    pool, outcomes, calls = refine_reduced_pool(
+        active, active, full, lambda d: True
+    )
+    assert pool == active
+    assert calls == 2
+    assert outcomes == {
+        frozenset([L("t", 1)]): True,
+        frozenset([L("t", 2)]): True,
+    }
+
+
+def test_refine_pool_gate_widens_on_nonsingleton_label():
+    # Self-join style: label t1 alone does not kill (its +5/-5 members
+    # cancel); the gate must stop immediately and widen back to the full
+    # pool, preserving the inert zero-pair labels.
+    active = {L("t", 1), L("t", 2), L("t", 3)}
+    inert = {L("t", 4)}
+    full = active | inert
+
+    def kills(d):
+        # t1 removes both cancelling members -> not killing; t2/t3 do.
+        if d == frozenset([L("t", 1)]):
+            return False
+        return True
+
+    pool, outcomes, calls = refine_reduced_pool(active, active, full, kills)
+    assert pool == full
+    assert calls == 1
+    assert outcomes == {frozenset([L("t", 1)]): False}
+
+
+def test_refine_pool_recomputes_count_toward_budget():
+    active = {L("t", 1), L("t", 2)}
+    with pytest.raises(SearchBudgetExceeded) as exc:
+        refine_reduced_pool(active, active, active, lambda d: True, max_calls=1)
+    assert exc.value.reason == "recompute_budget"
+    # The first call fits the budget; the second (which would exceed it)
+    # raises — the same convention as minimal_deletion_sets_by_recompute.
+    assert exc.value.details["recompute_calls"] == 2
+
+
+def test_search_reuses_gate_outcomes():
+    # Outcomes handed in via `known` are not recomputed; only the remaining
+    # candidates consume the per-search call budget.
+    pool = {L("t", 1), L("t", 2)}
+    known = {
+        frozenset(): False,
+        frozenset([L("t", 1)]): True,
+        frozenset([L("t", 2)]): True,
+    }
+    sols = minimal_deletion_sets_by_recompute(
+        pool,
+        lambda d: (_ for _ in ()).throw(AssertionError("should use cache")),
+        max_calls=0,
+        known=known,
+    )
+    assert sols == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
+    # A cached False outcome is a genuine cache hit (not mistaken for absent).
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: False, max_calls=5,
+        known={frozenset(): False, frozenset([L("t", 1)]): False},
+    )
+    assert sols == []
+
+
+def make_evaluator(spec):
+    return Evaluator({t["table"]: Table(t) for t in spec})
+
+
+def join_query():
+    return {
+        "type": "join",
+        "left": {"type": "scan", "table": "orders"},
+        "right": {"type": "scan", "table": "customers"},
+        "on": [{"left": "cust", "right": "id"}],
+    }
+
+
+def test_join_provenance():
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "cust", "amt"],
+            "rows": [
+                {"oid": 1, "cust": 10, "amt": 5},
+                {"oid": 2, "cust": 10, "amt": 7},
+                {"oid": 3, "cust": 20, "amt": 9},
+            ],
+        },
+        {
+            "table": "customers",
+            "primary_key": ["id"],
+            "columns": ["id", "name"],
+            "rows": [{"id": 10, "name": "A"}, {"id": 20, "name": "B"}],
+        },
+    ]
+    ev = make_evaluator(tables)
+    rows = ev.eval(join_query())
+    # find joined row oid=1
+    cols = ev.schema(join_query())
+    r1 = next(r for r in rows if r["data"][cols.index("oid")] == 1)
+    assert r1["witnesses"] == {frozenset([L("orders", 1), L("customers", 10)])}
+    assert len(rows) == 3
+
+
+def test_aggregate_group_witnesses():
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "cust", "amt"],
+            "rows": [
+                {"oid": 1, "cust": 10, "amt": 5},
+                {"oid": 2, "cust": 10, "amt": 7},
+                {"oid": 3, "cust": 20, "amt": 9},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "group_by": ["cust"],
+        "aggregates": [
+            {"fn": "count", "column": "*", "as": "n"},
+            {"fn": "sum", "column": "amt", "as": "total"},
+            {"fn": "min", "column": "amt", "as": "lo"},
+            {"fn": "max", "column": "amt", "as": "hi"},
+        ],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    cols = ev.schema(plan)
+    g10 = next(r for r in rows if r["data"][cols.index("cust")] == 10)
+    # count(*)=2 covers both members; sum=12 has the single minimal combo
+    # {1,2}; min=5 pins row 1 and max=7 pins row 2. The conjunction of all
+    # components requires both rows.
+    assert g10["witnesses"] == {frozenset([L("orders", 1), L("orders", 2)])}
+    data = dict(zip(cols, g10["data"]))
+    assert data == {"cust": 10, "n": 2, "total": 12, "lo": 5, "hi": 7}
+
+    # Deleting either member changes the aggregate values, so each singleton
+    # is a minimal deletion set — matching recomputation.
+    hs = minimal_hitting_sets(g10["witnesses"])
+    assert hs == [frozenset([L("orders", 1)]), frozenset([L("orders", 2)])]
+
+
+def test_aggregate_min_max_witnesses():
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "amt"],
+            "rows": [
+                {"oid": 1, "amt": 50},
+                {"oid": 2, "amt": 30},
+                {"oid": 3, "amt": 30},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "aggregates": [{"fn": "min", "column": "amt", "as": "lo"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # min=30: each equal-valued row is a minimal combo on its own.
+    assert rows[0]["witnesses"] == {
+        frozenset([L("orders", 2)]),
+        frozenset([L("orders", 3)]),
+    }
+    hs = minimal_hitting_sets(rows[0]["witnesses"])
+    assert hs == [frozenset([L("orders", 2), L("orders", 3)])]
+
+
+def test_aggregate_sum_minimal_combos():
+    from app.evaluator import minimal_sum_combos
+
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "amt"],
+            "rows": [
+                {"oid": 1, "amt": 50},
+                {"oid": 2, "amt": 30},
+                {"oid": 3, "amt": 0},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # The zero-valued row never participates in a minimal sum combination.
+    assert rows[0]["data"] == (80,)
+    assert rows[0]["witnesses"] == {frozenset([L("orders", 1), L("orders", 2)])}
+
+    # Equal-valued rows keep distinct combinations: 30a+30b and 60 both hit 60.
+    items = [
+        ({"id": "a"}, 30),
+        ({"id": "b"}, 30),
+        ({"id": "c"}, 60),
+    ]
+    combos = minimal_sum_combos(items, 60)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b"), ("c",)}
+    # Negative values: only the full set sums to the target.
+    items = [({"id": "a"}, 50), ({"id": "b"}, 30), ({"id": "c"}, -10)]
+    combos = minimal_sum_combos(items, 70)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b", "c")}
+
+    # Zero target: the empty selection is never a combination — the minimal
+    # witness is the non-empty cancelling pair.
+    items = [({"id": "a"}, 5), ({"id": "b"}, -5)]
+    combos = minimal_sum_combos(items, 0)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b")}
+
+
+def test_aggregate_sum_zero_total_witness():
+    """A zero total from mixed signs is witnessed by the non-empty pair."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [
+                {"id": 1, "v": 5},
+                {"id": 2, "v": -5},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    assert rows[0]["data"] == (0,)
+    # Not the trivial family from the empty combination: both rows pinned.
+    assert rows[0]["witnesses"] == {frozenset([L("t", 1), L("t", 2)])}
+    hs = minimal_hitting_sets(rows[0]["witnesses"])
+    assert hs == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
+
+
+def test_aggregate_null_components():
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [
+                {"id": 1, "v": 50},
+                {"id": 2, "v": None},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [
+            {"fn": "count", "column": "v", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # count(v)=1 and sum=50 ignore the NULL row: only row 1 is pinned.
+    assert rows[0]["data"] == (1, 50)
+    assert rows[0]["witnesses"] == {frozenset([L("t", 1)])}
+
+    # All-NULL sum/min/max: value NULL, only group existence is pinned.
+    plan_null = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "input": {"type": "scan", "table": "t"},
+            "predicate": {"column": "v", "op": "is_null"},
+        },
+        "aggregates": [
+            {"fn": "count", "column": "v", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    rows = ev.eval(plan_null)
+    assert rows[0]["data"] == (0, None)
+    assert rows[0]["witnesses"] == {frozenset([L("t", 2)])}
+
+
+def test_mixed_sign_sum_pool_reduction():
+    """5, 2, -2 + ten zero rows + one NULL row: only the three non-zero
+    labels survive candidate reduction for a plain sum."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}, {"id": 2, "v": 2}, {"id": 3, "v": -2}]
+            + [{"id": i, "v": 0} for i in range(4, 14)]
+            + [{"id": 14, "v": None}],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (5,))
+    assert pool is not None
+    assert pool.group_member_count == 14
+    assert pool.active_member_count == 3
+    assert pool.reduced == {L("t", 1), L("t", 2), L("t", 3)}
+    # The full pool covers all group-member witnesses (existence includes the
+    # NULL row); the reduced pool drops ten zero rows plus the NULL row.
+    assert len(pool.full) == 14
+    assert pool.dropped_inert_count == 11
+
+    # Same-sign sums (even with zero padding) do not enter the exact path.
+    tables_pos = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}] + [{"id": i, "v": 0} for i in range(2, 14)],
+        }
+    ]
+    ev_pos = make_evaluator(tables_pos)
+    assert ev_pos.mixed_sign_sum_pool(plan, (5,)) is None
+
+
+def test_mixed_sign_sum_pool_reduction_count_star():
+    """Under count(*) every member is active: zero rows stay in the pool."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 5}, {"id": 2, "v": 2}, {"id": 3, "v": -2}]
+            + [{"id": i, "v": 0} for i in range(4, 14)],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [
+            {"fn": "count", "column": "*", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (13, 5))
+    assert pool is not None
+    assert pool.active_member_count == 13
+    assert len(pool.reduced) == 13
+
+
+def test_mixed_sign_sum_pool_self_join_keeps_zero_pair_in_full_pool():
+    """Self-join: the zero-valued row4/row4 member is inert by value, so the
+    provisional reduced pool excludes ledger[4] — but it must remain in the
+    full pool so the dependency gate can widen the search (label 1 alone
+    removes the +5 and -5 members together and does not kill)."""
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "k", "amount"],
+            "rows": [
+                {"id": 1, "k": 1, "amount": 0},
+                {"id": 2, "k": 1, "amount": 5},
+                {"id": 3, "k": 1, "amount": -5},
+                {"id": 4, "k": 2, "amount": 0},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "predicate": {
+                "or": [
+                    {
+                        "and": [
+                            {"column": "id", "op": "=", "value": 1},
+                            {"column": "right.id", "op": ">=", "value": 2},
+                        ]
+                    },
+                    {"column": "id", "op": "=", "value": 4},
+                ]
+            },
+            "input": {
+                "type": "join",
+                "left": {"type": "scan", "table": "ledger"},
+                "right": {"type": "scan", "table": "ledger"},
+                "on": [{"left": "k", "right": "k"}],
+            },
+        },
+        "aggregates": [{"fn": "sum", "column": "right.amount", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (0,))
+    assert pool is not None
+    assert pool.full == {L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)}
+    assert pool.active_labels == {L("ledger", 1), L("ledger", 2), L("ledger", 3)}
+    assert pool.reduced == pool.active_labels
+    assert pool.group_member_count == 3
+    assert pool.active_member_count == 2
+
+
+def test_empty_aggregate_input():
+    from app.errors import ApiError
+
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [{"id": 1, "v": 1}],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "input": {"type": "scan", "table": "t"},
+            "predicate": {"column": "v", "op": "=", "value": 99},
+        },
+        "aggregates": [{"fn": "count", "column": "*", "as": "n"}],
+    }
+    ev = make_evaluator(tables)
+    try:
+        ev.eval(plan)
+        assert False, "expected ApiError"
+    except ApiError as e:
+        assert e.code == "EMPTY_AGGREGATE"
